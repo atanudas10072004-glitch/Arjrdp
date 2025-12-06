@@ -5,11 +5,10 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-latest   # Use self-hosted Windows runner for persistence
+    runs-on: windows-latest   # Use a self-hosted Windows runner for persistence
     timeout-minutes: 3600
 
     env:
-      # use repository secrets; set these in Settings -> Secrets
       TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
     steps:
@@ -23,16 +22,15 @@ jobs:
             -Name "fDenyTSConnections" -Value 0 -Force -ErrorAction Stop
           Write-Host "Enabled Remote Desktop (fDenyTSConnections = 0)"
 
-          # Disable NLA (optional) - comment out if you want to keep NLA enabled (recommended)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force -ErrorAction Continue
-          Write-Host "Set UserAuthentication = 0 (NLA disabled) — comment out to keep NLA."
+          # OPTIONAL: Disable NLA (UserAuthentication = 0). Comment out to keep NLA enabled (recommended).
+          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          #   -Name "UserAuthentication" -Value 0 -Force -ErrorAction Continue
 
           # Optional: set SecurityLayer (0 = RDP, 1 = Negotiate, 2 = SSL)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force -ErrorAction Continue
 
-          # Restart TermService to apply registry changes
+          # Ensure TermService is automatic and restart to apply changes
           Try {
             Set-Service -Name TermService -StartupType Automatic -ErrorAction Stop
             Restart-Service -Name TermService -Force -ErrorAction Stop
@@ -41,7 +39,7 @@ jobs:
             Write-Warning "Could not restart TermService: $_"
           }
 
-          # Remove any existing rule with the same name to avoid duplication, then allow TCP 3389
+          # Manage firewall: remove old rule if present, allow TCP 3389
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 | Out-Null
           Write-Host "Firewall rule RDP-Tailscale added (TCP 3389 allowed)."
@@ -77,7 +75,7 @@ jobs:
               $acct = Get-LocalUser -Name $username
               $acct | Set-LocalUser -Password $securePass -ErrorAction Stop
             } catch {
-              Write-Warning "Failed to update password for $username: $_"
+              Write-Warning "Failed to update password for ${username}: $($_)"
             }
           } else {
             try {
@@ -93,19 +91,17 @@ jobs:
           try {
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
             Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction Stop
+            Write-Host "Added $username to Remote Desktop Users and Administrators."
           } catch {
             Write-Warning "Could not add user to one or more groups: $_"
           }
 
-          # Expose credentials to subsequent steps via GITHUB_ENV
-          # WARNING: This writes the cleartext password to environment — treat carefully (will appear in logs if printed).
+          # Save credentials to GITHUB_ENV for later steps
+          # WARNING: This writes the cleartext password to environment — treat carefully (do not print it).
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
 
-          # Output for this step only (not shown in subsequent steps); also set step output
-          Write-Host "User created: $username"
-          echo "::set-output name=username::$username"
-          echo "::set-output name=password::$password"
+          Write-Host "Local RDP user created and credentials stored to GITHUB_ENV."
 
       - name: Install Tailscale
         shell: pwsh
@@ -117,6 +113,7 @@ jobs:
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed."
 
       - name: Establish Tailscale Connection
         shell: pwsh
@@ -136,7 +133,6 @@ jobs:
             exit 1
           }
 
-          # Use YAML secret interpolation for authkey; ensure it's quoted
           & $exe up --authkey="$($env:TAILSCALE_AUTH_KEY)" --hostname="gh-runner-$($env:GITHUB_RUN_ID)" | Out-Null
 
           # Wait for an IPv4 address to be assigned
@@ -146,7 +142,6 @@ jobs:
             Start-Sleep -Seconds 3
             $ips = & $exe ip -4 2>$null
             if ($ips) {
-              # tailscale ip -4 may return multiple lines; take the first non-empty line
               $tsIP = ($ips -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })[0]
             }
             $retries++
@@ -171,11 +166,10 @@ jobs:
           }
 
           $test = Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue
-          if (-not $test.TcpTestSucceeded) {
-            Write-Warning "TCP test to $ip:3389 failed. It may still work depending on timing and firewall rules."
-            # Not exiting here to allow user to try connecting; change behavior if strict checking desired.
-          } else {
+          if ($test.TcpTestSucceeded) {
             Write-Host "TCP connectivity to RDP port confirmed."
+          } else {
+            Write-Warning "TCP test to $ip:3389 failed. It may still work depending on timing and firewall rules."
           }
 
       - name: Show connection info (short-lived)
@@ -184,9 +178,6 @@ jobs:
           Write-Host "=== RDP ACCESS INFO (use immediately) ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: (redacted in logs for safety)"
-          # If you need to print password (NOT recommended), uncomment below:
-          # Write-Host "Password: $env:RDP_PASSWORD"
-
+          Write-Host "Password: (stored in environment variable RDP_PASSWORD; not printed for safety)"
           Write-Host ""
-          Write-Host "IMPORTANT: This runner is ephemeral. For a persistent RDP host use a self-hosted Windows runner or configure a permanent machine."
+          Write-Host "Note: This runner is ephemeral. For a persistent RDP host use a self-hosted Windows runner or configure a permanent machine."
